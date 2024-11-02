@@ -1,0 +1,307 @@
+#!/bin/bash
+
+function error_handler() {
+  echo "Error occurred in script at line: ${1}."
+  echo "Line exited with status: ${2}"
+}
+
+trap 'error_handler ${LINENO} $?' ERR
+
+set -o errexit
+set -o errtrace
+set -o nounset
+
+# done setting up error handling. actual code follows.
+
+if [[ ! -d "test/fixtures" ]] ; then
+  echo "please run tests from the root of the delete-docker-registry-image repo, so there is a test/fixtures directory available"
+  exit 1
+fi
+
+function get_test_docker_container_ids() {
+  docker ps -a | grep localhost:5000/test | awk '{print $1}'
+}
+
+function get_test_docker_image_ids() {
+  docker images | grep localhost:5000/test | awk '{print $3}'
+}
+
+function delete_test_docker_images() {
+  (get_test_docker_image_ids | xargs docker rmi -f) || true
+}
+
+# if it finds a directory, fail. If not, noop.
+function assert_that_registry_has_no_data() {
+
+  # who cares about uploads. they are temporary and we can delete them anytime.
+  find /opt/registry_data/docker/registry/v2 -name _uploads -type d | sudo xargs rm -rf
+
+  # delete empty directories after killing _uploads dirs
+  lines=$(find /opt/registry_data/docker/registry/v2/* -type d -empty 2>/dev/null | wc -l)
+  if [ $lines -gt 0 ]; then
+    sudo find /opt/registry_data/docker/registry/v2/* -type d -empty -delete
+  fi
+
+  if [ "$(ls -A /opt/registry_data/docker/registry/v2)" ]; then
+    echo "ASSERTION FAILURE: registry has data when we expected it not to have data. leaf node dirs:"
+    # finding -type d (directories) with 2 links gets just "leaf" node directories
+    find /opt/registry_data/docker/registry/v2 -type d -links 2
+    i=0; while caller $i ;do ((i++)) ;done
+    false
+  fi
+}
+
+function build_test_image() {
+  previous_location=$PWD
+  cd test/fixtures/$1
+  image=$(cat image)
+  docker build -t $image .
+  cd $previous_location
+}
+
+function push_test_image() {
+  previous_location=$PWD
+  cd test/fixtures/$1
+  image=$(cat image)
+  docker push $image
+  cd $previous_location
+}
+
+function push_all_test_images() {
+  for test_image in `ls test/fixtures`; do
+    build_and_push_test_image $test_image
+  done
+}
+
+function build_test_images() {
+  for test_image in "$@"; do
+    build_test_image $test_image
+  done
+}
+
+function build_and_push_test_images() {
+  for test_image in "$@"; do
+    build_test_image $test_image
+    push_test_image $test_image
+  done
+}
+
+function delete_all_registry_data() {
+  sudo rm -rf /opt/registry_data/docker/registry/v2/repositories /opt/registry_data/docker/registry/v2/blobs
+}
+
+function back_up_registry_data_for_later_inspection_in_case_test_fails() {
+  sudo rm -rf /opt/registry_data/docker/registry/v2_backup
+  sudo cp -r /opt/registry_data/docker/registry/v2 /opt/registry_data/docker/registry/v2_backup
+}
+
+function delete_all_test_data() {
+  for id in $(get_test_docker_container_ids); do docker stop $id; done
+  for id in $(get_test_docker_container_ids); do docker rm $id; done
+  delete_test_docker_images
+  delete_all_registry_data
+}
+
+function run_delete() {
+  sudo /vagrant/delete_docker_registry_image.py "$@"
+}
+
+function bounce_registry() {
+  docker ps | grep registry | awk '{ print $1 }' | xargs -n 1 docker restart
+}
+
+function setup() {
+  delete_all_test_data
+  bounce_registry
+}
+
+function test_deleting_untagged() {
+  setup
+  build_test_images a b c
+
+  docker tag localhost:5000/test/b localhost:5000/test/repousinglatest
+  docker push localhost:5000/test/repousinglatest
+
+  docker tag localhost:5000/test/a localhost:5000/test/repousinglatest
+  docker push localhost:5000/test/repousinglatest
+
+  docker tag localhost:5000/test/c:1 localhost:5000/test/repousinglatest
+  docker push localhost:5000/test/repousinglatest
+
+  before=$(find /opt/registry_data/docker/registry/v2/blobs -type f | wc -l)
+  run_delete --image test/repousinglatest --force --prune --untagged
+  after=$(find /opt/registry_data/docker/registry/v2/blobs -type f | wc -l)
+
+  if [ ! "$after" -lt "$before" ]; then
+    echo "After deleting --untagged, the number of blobs is unchanged: before: $before. after: $after"
+    exit 1
+  fi
+
+  delete_test_docker_images
+
+  docker pull localhost:5000/test/repousinglatest
+
+  if ! docker run -it localhost:5000/test/repousinglatest ls test | grep 'c' > /dev/null; then
+    echo "Did not see expected file (c) in container"
+    exit 1
+  fi
+
+  run_delete --image test/repousinglatest:latest --force --prune
+  delete_test_docker_images
+  assert_that_registry_has_no_data
+}
+
+function test_deleting_a_tag_and_then_repushing_it_works() {
+  setup
+  build_test_images a
+  docker tag localhost:5000/test/a localhost:5000/test/somethingwithtag:1
+  docker push localhost:5000/test/somethingwithtag:1
+  run_delete --image test/somethingwithtag:1
+  bounce_registry
+  docker push localhost:5000/test/somethingwithtag:1
+  delete_test_docker_images
+  docker pull localhost:5000/test/somethingwithtag:1
+}
+
+function test_deleting_all_images_deletes_all_data() {
+  setup
+  build_and_push_test_images a b
+
+  docker tag localhost:5000/test/a localhost:5000/test/somethingwithtag:1
+  docker push localhost:5000/test/somethingwithtag:1
+  run_delete --image test/somethingwithtag:1 --force --prune
+  delete_test_docker_images
+  docker pull localhost:5000/test/a # we haven't deleted this image yet, even though it has the same data as the tag we deleted. confirm we can still pull it.
+
+  run_delete --image test/a --force --prune
+  delete_test_docker_images
+  docker pull localhost:5000/test/b # we haven't deleted b from the registry yet. confirm that we can pull it with no issue.
+  docker tag localhost:5000/test/b localhost:5000/test/somethingelsewithtag:1
+  docker push localhost:5000/test/somethingelsewithtag:1
+  docker pull localhost:5000/test/somethingelsewithtag:1 # of course this works, right
+  run_delete --image test/b --force --prune
+  delete_test_docker_images
+  docker pull localhost:5000/test/somethingelsewithtag:1 # we haven't deleted this tag yet, even though it has the same data as b. confirm we can still pull it.
+  run_delete --image test/somethingelsewithtag:1 --force --prune
+  assert_that_registry_has_no_data
+}
+
+function test_deleting_tag_first_does_not_leave_stuff_lying_around() {
+  setup
+  build_and_push_test_images a
+  docker tag localhost:5000/test/a localhost:5000/test/somethingwithtag:1
+  docker push localhost:5000/test/somethingwithtag:1
+  back_up_registry_data_for_later_inspection_in_case_test_fails
+  run_delete --image test/somethingwithtag:1 --force --prune -v
+  delete_test_docker_images
+  docker pull localhost:5000/test/a # we haven't deleted this image yet, even though it has the same data as the tag we deleted. confirm we can still pull it.
+  run_delete --image test/a --force --prune
+  assert_that_registry_has_no_data
+}
+
+function test_deleting_an_image_does_not_harm_an_equivalent_tag_in_another_repo() {
+  setup
+  build_and_push_test_images a
+  docker tag localhost:5000/test/a localhost:5000/test/stillanotherthingwithtag:1
+  docker push localhost:5000/test/stillanotherthingwithtag:1
+  delete_test_docker_images
+  docker pull localhost:5000/test/stillanotherthingwithtag:1 # of course this works, right
+  run_delete --image test/a --force --prune -v
+  delete_test_docker_images
+  docker pull localhost:5000/test/stillanotherthingwithtag:1 # we haven't deleted this tag yet, even though it has the same data as b. confirm we can still pull it.
+  run_delete --image test/stillanotherthingwithtag:1 --force --prune
+  assert_that_registry_has_no_data
+}
+
+function test_deleting_by_tag() {
+  setup
+  build_and_push_test_images c d
+  run_delete --image test/c:1 --force --prune
+  delete_test_docker_images
+  docker pull localhost:5000/test/c:2 # we haven't deleted d (c:2) from the registry yet. confirm that we can pull it with no issue.
+  run_delete --image test/c:2 --force --prune
+  assert_that_registry_has_no_data
+}
+
+function test_deleting_actually_deletes() {
+  setup
+  build_and_push_test_images c
+  run_delete --image test/c:1 --force --prune
+  delete_test_docker_images
+  if docker pull localhost:5000/test/c:1; then
+    echo "we should not have been able to pull that deleted repo"
+    exit 1
+  fi
+  assert_that_registry_has_no_data
+}
+
+function test_deleting_with_dry_run_does_not_delete() {
+  setup
+  build_and_push_test_images c
+  run_delete --image test/c:1 --force --prune --dry-run
+  delete_test_docker_images
+  docker pull localhost:5000/test/c:1
+  run_delete --image test/c:1 --force --prune
+  assert_that_registry_has_no_data
+}
+
+function test_deleting_with_no_image_argument_tells_you_to_try_again() {
+  setup
+  if run_delete --image test 2>&1 | grep "No repository 'test' found in repositories directory"; then
+    echo "Yep, we expected this error message before adding a repo"
+  else
+    echo "Did not receive expected error message when trying to delete before adding a repo"
+    exit 1
+  fi
+  build_and_push_test_images a
+  if run_delete 2>&1 | grep 'image is required'; then
+    echo "Yep, we expected this error message"
+  else
+    echo "Did not receive expected error message when trying to delete with no image argument"
+    exit 1
+  fi
+  run_delete --image test/a --force --prune -v
+  assert_that_registry_has_no_data
+}
+
+function test_clean_old_versions() {
+  docker pull busybox
+
+  docker tag busybox localhost:5000/busybox/busy:1
+  docker tag busybox localhost:5000/busybox/busy:2
+  docker tag busybox localhost:5000/busybox/busy:3
+  docker tag busybox localhost:5000/busybox/busy:4
+  docker tag busybox localhost:5000/busybox/busy:latest
+
+  docker push localhost:5000/busybox/busy:1
+  docker push localhost:5000/busybox/busy:2
+  docker push localhost:5000/busybox/busy:3
+  docker push localhost:5000/busybox/busy:4
+  docker push localhost:5000/busybox/busy:latest
+
+  # clean any tags (.*) of busybox/busy. keep the four latest tags. so this should kill busybox/busy:1
+  sudo ./clean_old_versions.py --registry-url http://localhost:5000 --image 'busybox/busy' --include '.*' -l 4 --script-path /vagrant/delete_docker_registry_image.py
+
+  # remove image locally
+  docker rmi localhost:5000/busybox/busy:1
+
+  if docker pull localhost:5000/busybox/busy:1; then
+    echo "we should not have been able to pull the tag. it should have been deleted."
+    exit 1
+  fi
+
+  # confirm we can pull :2. it was one of the four that we were supposed to keep around.
+  docker push localhost:5000/busybox/busy:2
+}
+
+test_deleting_untagged
+test_deleting_all_images_deletes_all_data # fail
+test_deleting_tag_first_does_not_leave_stuff_lying_around # fail, but not any more
+test_deleting_an_image_does_not_harm_an_equivalent_tag_in_another_repo # pass
+test_deleting_by_tag # next three pass
+test_deleting_actually_deletes
+test_deleting_with_dry_run_does_not_delete
+test_deleting_with_no_image_argument_tells_you_to_try_again
+test_clean_old_versions
+
+echo TESTS PASSED
